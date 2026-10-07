@@ -36,47 +36,28 @@ func (t *Table) Upsert(rows []Row) (int, error) {
 }
 
 // commitRewrite 处理“读当前快照 -> 计算新数据 -> 整体重写提交”的公共流程，
-// 并发冲突时基于最新快照重算并重试。
+// 冲突处理与重试语义同 optimisticCommit：协作写者下第二次尝试全程持锁，
+// 必然串行成功；持锁仍被推进时返回 *ErrConcurrentModification。
 func (t *Table) commitRewrite(op Operation, merge func(cur Snapshot, curRows []Row) ([]Row, error)) (int, error) {
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		base, err := t.Current()
+	return t.optimisticCommit(func(cur Snapshot) (Snapshot, error) {
+		curRows, err := t.readSnapshotRows(cur)
 		if err != nil {
-			return 0, err
+			return Snapshot{}, err
 		}
-		curRows, err := t.readSnapshotRows(base)
+		merged, err := merge(cur, curRows)
 		if err != nil {
-			return 0, err
-		}
-		merged, err := merge(base, curRows)
-		if err != nil {
-			return 0, err // 校验类错误（如重复主键）直接返回，不重试
+			return Snapshot{}, err // 校验类错误（如重复主键）直接返回，不重试
 		}
 		files, err := t.writeChunked(merged)
 		if err != nil {
-			return 0, err
+			return Snapshot{}, err
 		}
-		t.mu.Lock()
-		curVer, err := t.currentVersion()
-		if err == nil && curVer != base.Version {
-			t.mu.Unlock()
-			continue // 基版本被并发推进，基于新基重算
-		}
-		if err != nil {
-			t.mu.Unlock()
-			return 0, err
-		}
-		v, err := t.commitLocked(Snapshot{
-			Schema:    base.Schema,
+		return Snapshot{
+			Schema:    cur.Schema,
 			DataFiles: files,
 			Operation: op,
-		})
-		t.mu.Unlock()
-		if err != nil {
-			return 0, err
-		}
-		return v, nil
-	}
-	return 0, fmt.Errorf("commit failed after %d retries", maxRetries)
+		}, nil
+	})
 }
 
 func (t *Table) readSnapshotRows(snap Snapshot) ([]Row, error) {

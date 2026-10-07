@@ -23,7 +23,7 @@ func (s *localStore) writeFileAtomic(relPath string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(abs), ".tmp-*")
+	tmp, err := os.CreateTemp(filepath.Dir(abs), ".inflight-*")
 	if err != nil {
 		return err
 	}

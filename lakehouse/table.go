@@ -2,6 +2,7 @@ package lakehouse
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,13 +19,25 @@ const (
 	maxRetries = 16
 )
 
-// Table 是一张本地数据湖表，句柄可在 goroutine 间共享。
+// commitMaxRetries 可在同包测试中临时调小，用于确定性地制造冲突结果。
+var commitMaxRetries = maxRetries
+
+// beforeCASHook 在“锁外准备完成、进入跨进程锁做 CAS”之间调用，
+// 仅用于测试注入并发提交；生产路径为空。
+var beforeCASHook func()
+
+// errCASAbort 是内部信号：CAS 发现基版本被推进，本次尝试作废重来。
+var errCASAbort = errors.New("cas abort: base version advanced")
+
+// Table 是一张本地数据湖表，句柄可在 goroutine 间共享；
+// 不同进程可各自 Open 同一目录并发读写。
 type Table struct {
 	store *localStore
 	mu    sync.Mutex // 串行化本进程内的提交
 }
 
 // Create 在 dir 下创建一张新表；目录下已存在表时返回错误。
+// 多个进程同时 Create 同一目录时，只有一个成功，其余得到明确错误。
 func Create(dir string, schema Schema) (*Table, error) {
 	if len(schema.Fields) == 0 {
 		return nil, fmt.Errorf("schema must have at least one field")
@@ -35,10 +48,17 @@ func Create(dir string, schema Schema) (*Table, error) {
 		}
 	}
 	store := newLocalStore(dir)
+	t := &Table{store: store}
+
+	// 跨进程锁内复查 current，防止两个进程同时建表。
+	lock, err := acquireFlock(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.release()
 	if store.exists(currentPtr) {
 		return nil, fmt.Errorf("table already exists at %s", dir)
 	}
-	t := &Table{store: store}
 	snap := Snapshot{
 		Version:   1,
 		Schema:    schema,
@@ -71,7 +91,12 @@ func (t *Table) Current() (Snapshot, error) {
 }
 
 // SnapshotAt 返回指定版本的历史快照。
+// 版本曾经存在但已被 Vacuum 回收时返回 *ErrSnapshotExpired；
+// 从未存在返回 *ErrSnapshotNotFound。
 func (t *Table) SnapshotAt(version int) (Snapshot, error) {
+	if err := t.checkExpired(version); err != nil {
+		return Snapshot{}, err
+	}
 	data, err := t.store.readFile(metaPath(version))
 	if os.IsNotExist(err) {
 		return Snapshot{}, ErrSnapshotNotFound{Version: version}
@@ -100,8 +125,16 @@ func (t *Table) Append(rows []Row) (int, error) {
 
 // EvolveSchema 校验并提交一次结构变更；数据文件不变，仅推进结构版本。
 func (t *Table) EvolveSchema(next Schema) (int, error) {
+	if err := checkSchemaChangeReadonly(next); err != nil {
+		return 0, err
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	lock, err := acquireFlock(t.store.dir)
+	if err != nil {
+		return 0, err
+	}
+	defer lock.release()
 	cur, err := t.Current()
 	if err != nil {
 		return 0, err
@@ -109,15 +142,44 @@ func (t *Table) EvolveSchema(next Schema) (int, error) {
 	if err := checkSchemaChange(cur.Schema, next); err != nil {
 		return 0, err
 	}
-	return t.commitLocked(Snapshot{
+	base, err := t.currentVersion()
+	if err != nil {
+		return 0, err
+	}
+	return t.commitAtLocked(base, Snapshot{
 		Schema:    next,
 		DataFiles: cur.DataFiles,
 		Operation: OpSchema,
 	})
 }
 
+// checkSchemaChangeReadonly 做一次不依赖当前快照的前置结构自洽校验，
+// 让明显的非法请求在抢锁前就失败。
+func checkSchemaChangeReadonly(next Schema) error {
+	seen := map[string]bool{}
+	for _, f := range next.Fields {
+		if f.Name == "" {
+			return fmt.Errorf("schema contains empty field name")
+		}
+		if seen[f.Name] {
+			return fmt.Errorf("schema contains duplicate field %q", f.Name)
+		}
+		seen[f.Name] = true
+	}
+	for _, pk := range next.PrimaryKey {
+		if !seen[pk] {
+			return ErrIncompatibleSchema{
+				Reason: ReasonDropPrimaryKey,
+				Detail: fmt.Sprintf("primary key column %q not in schema", pk),
+			}
+		}
+	}
+	return nil
+}
+
 // Read 读取指定快照版本下的全部有效行；version<=0 表示最新快照。
 // 同一版本的读取结果稳定且可复现：文件按名排序、行按文件内顺序返回。
+// 读取不持任何写锁，只经由不可变快照与不可变数据文件，与并发写入互不阻塞。
 func (t *Table) Read(version int) ([]Row, error) {
 	if version <= 0 {
 		v, err := t.currentVersion()
@@ -157,7 +219,7 @@ func (t *Table) currentVersion() (int, error) {
 
 // commitSnapshot 写入快照元数据并原子推进 current 指针。
 // 先写 v{N}.json 再原子替换 current：中途失败时 current 仍指向旧版本，
-// 未引用的元数据文件成为垃圾但不影响一致性。
+// 未引用的元数据文件成为垃圾但不影响一致性（Vacuum 会回收）。
 func (t *Table) commitSnapshot(snap Snapshot) error {
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -169,13 +231,9 @@ func (t *Table) commitSnapshot(snap Snapshot) error {
 	return t.store.writeFileAtomic(currentPtr, []byte(strconv.Itoa(snap.Version)))
 }
 
-// commitLocked 在持锁状态下提交一份新快照（版本 = 当前版本+1）。
-func (t *Table) commitLocked(snap Snapshot) (int, error) {
-	cur, err := t.currentVersion()
-	if err != nil {
-		return 0, err
-	}
-	snap.Version = cur + 1
+// commitAtLocked 在已持有跨进程锁的状态下，以 base+1 为版本号提交。
+func (t *Table) commitAtLocked(base int, snap Snapshot) (int, error) {
+	snap.Version = base + 1
 	snap.Timestamp = time.Now().UnixNano()
 	if err := t.commitSnapshot(snap); err != nil {
 		return 0, err
@@ -183,62 +241,171 @@ func (t *Table) commitLocked(snap Snapshot) (int, error) {
 	return snap.Version, nil
 }
 
-// commitData 处理“写数据文件 + 提交”的公共流程，带乐观并发重试：
-// 先在锁外准备数据文件，再在锁内校验基版本未变后提交；
-// 基版本被推进时返回 ErrConcurrentModification，由外层重试。
-func (t *Table) commitData(op Operation, rows []Row, build func(cur Snapshot, files []string) Snapshot) (int, error) {
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		t.mu.Lock()
-		base, err := t.currentVersion()
-		if err != nil {
-			t.mu.Unlock()
-			return 0, err
-		}
-		baseSnap, err := t.SnapshotAt(base)
-		if err != nil {
-			t.mu.Unlock()
-			return 0, err
-		}
-		if err := validateRows(baseSnap.Schema, rows); err != nil {
-			t.mu.Unlock()
-			return 0, err
-		}
-		if len(baseSnap.Schema.PrimaryKey) > 0 {
-			if err := checkBatchPKUnique(baseSnap.Schema, rows); err != nil {
-				t.mu.Unlock()
+// withCommitLock 持有“进程内互斥 + 跨进程文件锁”执行 fn。
+// fn 在锁内重新读取当前版本作为 CAS 依据。
+func (t *Table) withCommitLock(fn func(base int) error) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	lock, err := acquireFlock(t.store.dir)
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+	base, err := t.currentVersion()
+	if err != nil {
+		return err
+	}
+	return fn(base)
+}
+
+// optimisticCommit 是所有数据类提交的统一执行器：
+//
+//	attempt 0（乐观）：锁外读基快照、准备数据文件，再持双锁 CAS 提交。
+//	                 锁区极短，同进程/跨进程写者吞吐高；基版本被推进则本次作废。
+//	attempt >=1（串行）：持有“进程内互斥 + 跨进程文件锁”重新读最新基快照、
+//	                 重新准备并提交——协作写者无法再插入，必然不会饿死；
+//	                 若持锁期间仍观察到基版本变化，说明存在不遵守锁协议的
+//	                 外部写者，立即以 *ErrConcurrentModification 返回，
+//	                 由调用方自行决定是否重试。
+//
+// prepare 以当前基快照为输入，产出待提交快照（Schema/DataFiles/Operation），
+// 允许在其中写新数据文件；校验类错误直接中断、不重试。
+func (t *Table) optimisticCommit(prepare func(cur Snapshot) (Snapshot, error)) (int, error) {
+	var lastConflict error
+	for attempt := 0; attempt < commitMaxRetries; attempt++ {
+		if attempt == 0 {
+			// 第一段：锁外准备 + 锁内 CAS。
+			base, baseSnap, err := t.currentSnapshot()
+			if err != nil {
 				return 0, err
+			}
+			next0, perr := prepare(baseSnap)
+			if perr != nil {
+				return 0, perr
+			}
+			if beforeCASHook != nil {
+				beforeCASHook()
+			}
+			var committed int
+			err = t.withCommitLock(func(curBase int) error {
+				if curBase != base {
+					lastConflict = ErrConcurrentModification{Base: base, Current: curBase}
+					return errCASAbort
+				}
+				// 锁外准备的数据文件可能在此期间被一轮 Vacuum 当作“尚未引用
+				// 的新文件”清掉（rename 完成到拿锁之间存在窗口）。确认文件仍在，
+				// 否则作废重算（第二段会在锁内重新写文件，Vacuum 无法再插入）。
+				if err := t.dataFilesExist(next0.DataFiles); err != nil {
+					lastConflict = err
+					return errCASAbort
+				}
+				v, err := t.commitAtLocked(curBase, next0)
+				if err != nil {
+					return err
+				}
+				committed = v
+				return nil
+			})
+			if errors.Is(err, errCASAbort) {
+				continue
+			}
+			if err != nil {
+				return 0, err
+			}
+			return committed, nil
+		}
+
+		// 第二段起：全程持锁重算，协作写者无法插队。
+		var committed int
+		err := t.withCommitLock(func(base int) error {
+			baseSnap, err := t.SnapshotAt(base)
+			if err != nil {
+				return err
+			}
+			next, perr := prepare(baseSnap)
+			if perr != nil {
+				return perr
+			}
+			curBase, err := t.currentVersion()
+			if err != nil {
+				return err
+			}
+			if curBase != base {
+				lastConflict = ErrConcurrentModification{Base: base, Current: curBase}
+				return errCASAbort
+			}
+			if err := t.dataFilesExist(next.DataFiles); err != nil {
+				lastConflict = err
+				return errCASAbort
+			}
+			v, err := t.commitAtLocked(curBase, next)
+			if err != nil {
+				return err
+			}
+			committed = v
+			return nil
+		})
+		if errors.Is(err, errCASAbort) {
+			// 持锁仍被推进：非协作写者。不再空转，把冲突交给调用方。
+			return 0, lastConflict
+		}
+		if err != nil {
+			return 0, err
+		}
+		return committed, nil
+	}
+	if lastConflict != nil {
+		return 0, lastConflict
+	}
+	return 0, fmt.Errorf("commit failed after %d retries", commitMaxRetries)
+}
+
+// commitData 处理“写数据文件 + 提交”的公共流程，冲突由 optimisticCommit 处理。
+func (t *Table) commitData(op Operation, rows []Row, build func(cur Snapshot, files []string) Snapshot) (int, error) {
+	return t.optimisticCommit(func(cur Snapshot) (Snapshot, error) {
+		if err := validateRows(cur.Schema, rows); err != nil {
+			return Snapshot{}, err
+		}
+		if len(cur.Schema.PrimaryKey) > 0 {
+			if err := checkBatchPKUnique(cur.Schema, rows); err != nil {
+				return Snapshot{}, err
 			}
 		}
 		var files []string
 		if len(rows) > 0 {
 			f, err := t.writeDataFile(rows)
 			if err != nil {
-				t.mu.Unlock()
-				return 0, err
+				return Snapshot{}, err
 			}
 			files = []string{f}
 		}
-		// 乐观并发校验：持锁期间基版本被外部（其他进程）推进则放弃重试
-		curVer, err := t.currentVersion()
-		if err == nil && curVer != base {
-			t.mu.Unlock()
-			_ = ErrConcurrentModification{Base: base, Current: curVer}
-			continue
-		}
-		if err != nil {
-			t.mu.Unlock()
-			return 0, err
-		}
-		snap := build(baseSnap, files)
+		snap := build(cur, files)
 		snap.Operation = op
-		v, err := t.commitLocked(snap)
-		t.mu.Unlock()
-		if err != nil {
-			return 0, err
-		}
-		return v, nil
+		return snap, nil
+	})
+}
+
+// currentSnapshot 读取当前版本及其快照（不加锁，供锁外准备阶段使用）。
+func (t *Table) currentSnapshot() (int, Snapshot, error) {
+	base, err := t.currentVersion()
+	if err != nil {
+		return 0, Snapshot{}, err
 	}
-	return 0, fmt.Errorf("commit failed after %d retries", maxRetries)
+	snap, err := t.SnapshotAt(base)
+	if err != nil {
+		return 0, Snapshot{}, err
+	}
+	return base, snap, nil
+}
+
+// dataFilesExist 确认候选快照引用的每个数据文件都还在磁盘上。
+func (t *Table) dataFilesExist(files []string) error {
+	for _, f := range files {
+		if !t.store.exists(f) {
+			return fmt.Errorf("data file %s vanished before commit (collected by concurrent vacuum?)", f)
+		}
+	}
+	return nil
 }
 
 // writeDataFile 把一批行写成一个数据文件，返回相对路径。
