@@ -2,7 +2,10 @@
 // 快照式提交、结构演进、小文件合并与按主键增量更新。
 package lakehouse
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // DataType 是列的物理类型。
 type DataType string
@@ -44,11 +47,12 @@ type Row map[string]any
 type Operation string
 
 const (
-	OpCreate  Operation = "create"
-	OpAppend  Operation = "append"
-	OpUpsert  Operation = "upsert"
-	OpCompact Operation = "compact"
-	OpSchema  Operation = "schema"
+	OpCreate   Operation = "create"
+	OpAppend   Operation = "append"
+	OpUpsert   Operation = "upsert"
+	OpCompact  Operation = "compact"
+	OpSchema   Operation = "schema"
+	OpRollback Operation = "rollback"
 )
 
 // Snapshot 是一份不可变的表快照元数据。
@@ -58,6 +62,8 @@ type Snapshot struct {
 	DataFiles []string  `json:"dataFiles"`
 	Operation Operation `json:"operation"`
 	Timestamp int64     `json:"timestamp"`
+	// RollbackOf 非零时表示该快照是一次回滚提交，内容复制自该版本。
+	RollbackOf int `json:"rollbackOf,omitempty"`
 }
 
 // ---- 可区分的错误类型 ----
@@ -108,4 +114,65 @@ type ErrSnapshotNotFound struct {
 
 func (e ErrSnapshotNotFound) Error() string {
 	return fmt.Sprintf("snapshot not found: version %d", e.Version)
+}
+
+// ---- 标签与历史 ----
+
+// ErrTagNotFound 表示按名字解析标签时，该名字当前没有指向任何版本。
+type ErrTagNotFound struct {
+	Name string
+}
+
+func (e ErrTagNotFound) Error() string {
+	return fmt.Sprintf("tag not found: %q", e.Name)
+}
+
+// ErrInvalidTagName 表示标签名不合法（空串、含路径分隔符或点开头等）。
+type ErrInvalidTagName struct {
+	Name string
+}
+
+func (e ErrInvalidTagName) Error() string {
+	return fmt.Sprintf("invalid tag name: %q", e.Name)
+}
+
+// ErrSnapshotExpired 表示快照曾经存在，但已被回收策略清理，无法再读取或回滚。
+// 与 ErrSnapshotNotFound（该版本号从未存在）区分开。
+type ErrSnapshotExpired struct {
+	Version int
+}
+
+func (e ErrSnapshotExpired) Error() string {
+	return fmt.Sprintf("snapshot expired: version %d", e.Version)
+}
+
+// HistoryEntry 描述历史列表中的一个版本。
+type HistoryEntry struct {
+	Version   int       `json:"version"`
+	Operation Operation `json:"operation"`
+	Timestamp int64     `json:"timestamp"`
+	// Tags 是当时指向该版本的全部标签名（已排序）。
+	Tags []string `json:"tags,omitempty"`
+	// Expired 表示该版本已被回收：元数据与数据文件均已删除。
+	Expired bool `json:"expired,omitempty"`
+}
+
+// ---- 回收 ----
+
+// RetentionPolicy 描述快照保留窗口，两个条件取并集（满足任一即保留）：
+//   - MinSnapshots>0：至少保留最近的 N 个快照；
+//   - OlderThan>0：保留时间戳晚于 now-OlderThan 的快照。
+//
+// 此外当前快照、被标签指向的快照始终保留，与窗口无关。
+// 零值策略表示除“强制保留”外不额外保留任何历史。
+type RetentionPolicy struct {
+	MinSnapshots int
+	OlderThan     time.Duration
+}
+
+// ExpireResult 汇报一次回收实际清理的内容。
+type ExpireResult struct {
+	ExpiredVersions []int    `json:"expiredVersions"`
+	DeletedFiles    []string `json:"deletedFiles"`
+	KeptVersions    []int    `json:"keptVersions"`
 }
